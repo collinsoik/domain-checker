@@ -222,7 +222,7 @@ async def run_iteration4_test():
 
     # Create test database
     test_variations = create_test_database(1000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_domain_checks.db")
+    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_domain_checks.duckdb")
 
     # Remove old checks
     if test_checks.exists():
@@ -254,7 +254,7 @@ async def run_iteration5_test():
 
     # Create test database with 2000 domains
     test_variations = create_test_database(2000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_resume_checks.db")
+    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_resume_checks.duckdb")
 
     # Remove old checks
     if test_checks.exists():
@@ -309,9 +309,11 @@ async def run_iteration5_test():
     print(f"\nFinal results in DB: {stats2}")
 
     # Verify no duplicates
-    with __import__('sqlite3').connect(test_checks) as conn:
-        total_rows = conn.execute("SELECT COUNT(*) FROM domain_checks").fetchone()[0]
-        unique_domains = conn.execute("SELECT COUNT(DISTINCT domain) FROM domain_checks").fetchone()[0]
+    import duckdb
+    conn = duckdb.connect(str(test_checks), read_only=True)
+    total_rows = conn.execute("SELECT COUNT(*) FROM domain_checks").fetchone()[0]
+    unique_domains = conn.execute("SELECT COUNT(DISTINCT domain) FROM domain_checks").fetchone()[0]
+    conn.close()
 
     print(f"\nVerification:")
     print(f"  Total rows: {total_rows}")
@@ -328,7 +330,7 @@ async def run_iteration6_test():
 
     # Create test database with 100K domains
     test_variations = create_test_database(100000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_100k_checks.db")
+    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_100k_checks.duckdb")
 
     # Remove old checks
     if test_checks.exists():
@@ -354,8 +356,52 @@ async def run_iteration6_test():
     )
 
 
+async def run_production():
+    """Production run using environment variables."""
+    import os
+    from database import VARIATIONS_DUCKDB, CHECKS_DUCKDB
+    from whois_checker import PROXY_FILE
+
+    print("=" * 60)
+    print("PRODUCTION RUN")
+    print("=" * 60)
+    print(f"Variations DB: {VARIATIONS_DUCKDB}")
+    print(f"Checks DB: {CHECKS_DUCKDB}")
+    print(f"Proxy file: {PROXY_FILE}")
+    print(f"uvloop: {'enabled' if UVLOOP else 'not available'}")
+
+    # Get optional config from environment
+    max_proxies = int(os.environ.get("MAX_PROXIES", 0)) or None
+    batch_size = int(os.environ.get("BATCH_SIZE", BATCH_SIZE))
+    checkpoint_interval = int(os.environ.get("CHECKPOINT_INTERVAL", CHECKPOINT_INTERVAL))
+    limit = int(os.environ.get("LIMIT", 0)) or None
+    resume = os.environ.get("RESUME", "true").lower() == "true"
+
+    print(f"Max proxies: {max_proxies or 'all'}")
+    print(f"Batch size: {batch_size}")
+    print(f"Checkpoint interval: {checkpoint_interval}")
+    print(f"Limit: {limit or 'none'}")
+    print(f"Resume: {resume}")
+    print()
+
+    checker = DomainChecker(
+        variations_db=VARIATIONS_DUCKDB,
+        checks_db=CHECKS_DUCKDB,
+        proxy_file=PROXY_FILE,
+        max_proxies=max_proxies
+    )
+
+    await checker.run(
+        batch_size=batch_size,
+        checkpoint_interval=checkpoint_interval,
+        limit=limit,
+        resume=resume
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Domain Checker")
+    parser.add_argument("--run", action="store_true", help="Production run (uses env vars)")
     parser.add_argument("--test", action="store_true", help="Run Iteration 4 test")
     parser.add_argument("--test-resume", action="store_true", help="Run Iteration 5 resume test")
     parser.add_argument("--test-100k", action="store_true", help="Run Iteration 6 100K test")
@@ -366,15 +412,27 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.test:
+    if args.run:
+        asyncio.run(run_production())
+    elif args.test:
         asyncio.run(run_iteration4_test())
     elif args.test_resume:
         asyncio.run(run_iteration5_test())
     elif args.test_100k:
         asyncio.run(run_iteration6_test())
     else:
-        print("Available tests:")
+        print("Usage:")
+        print("  --run         : Production run (uses VARIATIONS_DB, CHECKS_DB, PROXY_FILE env vars)")
         print("  --test        : Iteration 4 - Database integration (1K domains)")
         print("  --test-resume : Iteration 5 - Checkpoint/resume test (2K domains)")
         print("  --test-100k   : Iteration 6 - Full scale test (100K domains)")
-        print("  Full production run coming in Iteration 7")
+        print()
+        print("Environment variables for --run:")
+        print("  VARIATIONS_DB       : Path to domain variations DuckDB")
+        print("  CHECKS_DB           : Path to results DuckDB")
+        print("  PROXY_FILE          : Path to proxy list file")
+        print("  MAX_PROXIES         : Limit number of proxies (optional)")
+        print("  BATCH_SIZE          : Domains per batch (default: 10000)")
+        print("  CHECKPOINT_INTERVAL : Checkpoint frequency (default: 100000)")
+        print("  LIMIT               : Max domains to check (optional)")
+        print("  RESUME              : Resume from checkpoint (default: true)")

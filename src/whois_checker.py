@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Iteration 1: Optimized WHOIS Checker
+Optimized WHOIS Checker
 
 NOTE: WHOIS does NOT support connection reuse - server closes after each query.
 Each query requires a new CONNECT tunnel.
@@ -9,8 +9,12 @@ Optimizations:
 - Minimal response: Read only 64 bytes (enough to detect status)
 - Early detection: "No match" (available) or "Domain Name" (taken)
 - Parallel queries with asyncio.gather
+
+Environment Variables:
+    PROXY_FILE: Path to proxy list file (format: user:pass@host:port per line)
 """
 
+import os
 import asyncio
 import argparse
 import base64
@@ -32,7 +36,10 @@ WHOIS_PORT = 43
 RESPONSE_BYTES = 64  # Need enough to detect "No match for" or "Domain Name"
 TIMEOUT = 10
 
-PROXY_FILE = Path("/Users/collinsoik/Desktop/Code_Space/Proxy Status Checker/proxies.txt")
+PROXY_FILE = Path(os.environ.get(
+    "PROXY_FILE",
+    "/Users/collinsoik/Desktop/Code_Space/Proxy Status Checker/proxies.txt"
+))
 
 
 @dataclass

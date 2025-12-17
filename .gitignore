@@ -9,8 +9,10 @@ ENV/
 env/
 .venv/
 
-# SQLite databases
+# Databases
 *.db
+*.duckdb
+data/
 
 # IDE
 .idea/

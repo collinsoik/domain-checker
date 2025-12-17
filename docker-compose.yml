@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  domain-checker:
+    build: .
+    container_name: domain-checker
+    restart: unless-stopped
+    volumes:
+      # Mount data directory containing:
+      # - domain_variations.duckdb (read-only source)
+      # - domain_checks.duckdb (results - will be created)
+      # - proxies.txt (proxy list)
+      - ./data:/data
+    environment:
+      - VARIATIONS_DB=/data/domain_variations.duckdb
+      - CHECKS_DB=/data/domain_checks.duckdb
+      - PROXY_FILE=/data/proxies.txt
+      - RESUME=true
+      - BATCH_SIZE=10000
+      - CHECKPOINT_INTERVAL=100000
+      # Optional: limit proxies or domains
+      # - MAX_PROXIES=500
+      # - LIMIT=1000000
+    # For long-running tasks, increase stop timeout
+    stop_grace_period: 60s
+    # Log configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"

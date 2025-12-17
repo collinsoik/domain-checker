@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """
-Iteration 4: Database Integration
+Database Integration (DuckDB)
 
-Reads domains from domain_variations.db, writes results to domain_checks.db.
+Reads domains from domain_variations.duckdb, writes results to domain_checks.duckdb.
 Tracks which domains have been checked for resume capability.
+
+Environment Variables:
+    VARIATIONS_DB: Path to domain variations DuckDB file
+    CHECKS_DB: Path to results DuckDB file (will be created if not exists)
 """
 
-import sqlite3
+import os
+import duckdb
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Optional
 from dataclasses import dataclass
 from datetime import datetime
 
 
-# Default paths
-VARIATIONS_DB = Path("/Users/collinsoik/Desktop/Pre_Classifcation_Georgia/domain_matcher/data/output/domain_variations.db")
-CHECKS_DB = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/domain_checks.db")
+# Default paths (can be overridden by environment variables)
+VARIATIONS_DUCKDB = Path(os.environ.get(
+    "VARIATIONS_DB",
+    "/Users/collinsoik/Desktop/Code_Space/rdap_test/domain_variations.duckdb"
+))
+CHECKS_DUCKDB = Path(os.environ.get(
+    "CHECKS_DB",
+    "/Users/collinsoik/Desktop/Code_Space/rdap_test/domain_checks.duckdb"
+))
 
 
 @dataclass
@@ -28,57 +39,71 @@ class DomainResult:
 
 
 class DomainDatabase:
-    """Manages reading domain variations and writing check results."""
+    """Manages reading domain variations and writing check results using DuckDB."""
 
     def __init__(
         self,
-        variations_db: Path = VARIATIONS_DB,
-        checks_db: Path = CHECKS_DB
+        variations_db: Path = VARIATIONS_DUCKDB,
+        checks_db: Path = CHECKS_DUCKDB
     ):
         self.variations_db = variations_db
         self.checks_db = checks_db
+        self._variations_conn = None  # Lazy, read-only
+        self._checks_conn = None      # Lazy, read-write
         self._init_checks_db()
+
+    def _get_variations_conn(self):
+        """Get or create DuckDB connection for variations (read-only)."""
+        if self._variations_conn is None:
+            self._variations_conn = duckdb.connect(str(self.variations_db), read_only=True)
+        return self._variations_conn
+
+    def _get_checks_conn(self):
+        """Get or create DuckDB connection for checks (read-write)."""
+        if self._checks_conn is None:
+            self._checks_conn = duckdb.connect(str(self.checks_db))
+        return self._checks_conn
 
     def _init_checks_db(self):
         """Initialize the checks database with results table."""
-        with sqlite3.connect(self.checks_db) as conn:
-            conn.executescript("""
-                -- Results table
-                CREATE TABLE IF NOT EXISTS domain_checks (
-                    domain TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    error TEXT,
-                    checked_at TEXT DEFAULT CURRENT_TIMESTAMP
-                );
+        conn = self._get_checks_conn()
 
-                -- Index for querying by status
-                CREATE INDEX IF NOT EXISTS idx_status ON domain_checks(status);
+        # Create domain_checks table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS domain_checks (
+                domain VARCHAR PRIMARY KEY,
+                status VARCHAR NOT NULL,
+                error VARCHAR,
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-                -- Checkpoint table for resume
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    id INTEGER PRIMARY KEY,
-                    last_offset INTEGER,
-                    total_checked INTEGER,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-                );
+        # Create checkpoints table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id INTEGER PRIMARY KEY,
+                last_offset BIGINT,
+                total_checked BIGINT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-                -- Performance settings
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-                PRAGMA cache_size = 10000;
-            """)
+        # Create index for status queries
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_status ON domain_checks(status)
+        """)
 
     def get_total_domains(self) -> int:
         """Get total number of domains to check."""
-        with sqlite3.connect(self.variations_db) as conn:
-            result = conn.execute("SELECT COUNT(*) FROM domain_variations").fetchone()
-            return result[0] if result else 0
+        conn = self._get_variations_conn()
+        result = conn.execute("SELECT COUNT(*) FROM domain_variations").fetchone()
+        return result[0] if result else 0
 
     def get_checked_count(self) -> int:
         """Get number of domains already checked."""
-        with sqlite3.connect(self.checks_db) as conn:
-            result = conn.execute("SELECT COUNT(*) FROM domain_checks").fetchone()
-            return result[0] if result else 0
+        conn = self._get_checks_conn()
+        result = conn.execute("SELECT COUNT(*) FROM domain_checks").fetchone()
+        return result[0] if result else 0
 
     def get_unchecked_domains(
         self,
@@ -87,24 +112,20 @@ class DomainDatabase:
     ) -> list[str]:
         """
         Get batch of unchecked domains.
-        Uses LEFT JOIN to exclude already-checked domains.
+        Uses two-phase approach: get from variations, filter against checks.
         """
-        # For efficiency, we'll use offset-based pagination
-        # and check against the results table
-        with sqlite3.connect(self.variations_db) as conn:
-            # Attach checks database
-            conn.execute(f"ATTACH DATABASE '{self.checks_db}' AS checks")
+        # Get candidates from variations
+        candidates = self.get_domains_batch(batch_size * 2, offset)
+        if not candidates:
+            return []
 
-            query = """
-                SELECT dv.domain
-                FROM domain_variations dv
-                LEFT JOIN checks.domain_checks dc ON dv.domain = dc.domain
-                WHERE dc.domain IS NULL
-                LIMIT ?
-            """
+        # Filter against checks
+        conn = self._get_checks_conn()
+        placeholders = ','.join(['?' for _ in candidates])
+        query = f"SELECT domain FROM domain_checks WHERE domain IN ({placeholders})"
+        checked = set(row[0] for row in conn.execute(query, candidates).fetchall())
 
-            results = conn.execute(query, (batch_size,)).fetchall()
-            return [row[0] for row in results]
+        return [d for d in candidates if d not in checked][:batch_size]
 
     def get_domains_batch(
         self,
@@ -112,91 +133,108 @@ class DomainDatabase:
         offset: int = 0
     ) -> list[str]:
         """Get batch of domains using simple offset (faster for sequential reads)."""
-        with sqlite3.connect(self.variations_db) as conn:
-            query = "SELECT domain FROM domain_variations LIMIT ? OFFSET ?"
-            results = conn.execute(query, (batch_size, offset)).fetchall()
-            return [row[0] for row in results]
+        conn = self._get_variations_conn()
+        query = "SELECT domain FROM domain_variations LIMIT ? OFFSET ?"
+        results = conn.execute(query, [batch_size, offset]).fetchall()
+        return [row[0] for row in results]
 
     def save_results(self, results: list[DomainResult]):
         """Save batch of results to database."""
         if not results:
             return
 
-        with sqlite3.connect(self.checks_db) as conn:
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO domain_checks (domain, status, error, checked_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                [(r.domain, r.status, r.error) for r in results]
-            )
+        conn = self._get_checks_conn()
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO domain_checks (domain, status, error, checked_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            [(r.domain, r.status, r.error) for r in results]
+        )
 
     def save_checkpoint(self, offset: int, total_checked: int):
         """Save checkpoint for resume."""
-        with sqlite3.connect(self.checks_db) as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO checkpoints (id, last_offset, total_checked, updated_at)
-                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                (offset, total_checked)
-            )
+        conn = self._get_checks_conn()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO checkpoints (id, last_offset, total_checked, updated_at)
+            VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            [offset, total_checked]
+        )
 
     def get_checkpoint(self) -> tuple[int, int]:
         """Get last checkpoint (offset, total_checked)."""
-        with sqlite3.connect(self.checks_db) as conn:
-            result = conn.execute(
-                "SELECT last_offset, total_checked FROM checkpoints WHERE id = 1"
-            ).fetchone()
-            return result if result else (0, 0)
+        conn = self._get_checks_conn()
+        result = conn.execute(
+            "SELECT last_offset, total_checked FROM checkpoints WHERE id = 1"
+        ).fetchone()
+        return (result[0], result[1]) if result else (0, 0)
 
     def get_stats(self) -> dict:
         """Get check statistics."""
-        with sqlite3.connect(self.checks_db) as conn:
-            stats = {}
+        conn = self._get_checks_conn()
+        stats = {}
 
-            # Count by status
-            for row in conn.execute(
-                "SELECT status, COUNT(*) FROM domain_checks GROUP BY status"
-            ):
-                stats[row[0]] = row[1]
+        # Count by status
+        for row in conn.execute(
+            "SELECT status, COUNT(*) FROM domain_checks GROUP BY status"
+        ).fetchall():
+            stats[row[0]] = row[1]
 
-            # Total
-            stats['total'] = sum(stats.values())
+        # Total
+        stats['total'] = sum(stats.values())
 
-            return stats
+        return stats
+
+    def close(self):
+        """Close database connections."""
+        if self._variations_conn is not None:
+            self._variations_conn.close()
+            self._variations_conn = None
+        if self._checks_conn is not None:
+            self._checks_conn.close()
+            self._checks_conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 def create_test_database(num_domains: int = 1000) -> Path:
-    """Create a test variations database for testing."""
-    test_db = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_variations.db")
+    """Create a test variations database for testing (DuckDB format)."""
+    test_db = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_variations.duckdb")
 
     # Remove if exists
     if test_db.exists():
         test_db.unlink()
 
-    with sqlite3.connect(test_db) as conn:
-        conn.execute("""
-            CREATE TABLE domain_variations (
-                domain TEXT PRIMARY KEY
-            )
-        """)
-
-        # Generate mix of real and fake domains
-        real = ["google.com", "amazon.com", "microsoft.com", "github.com", "apple.com",
-                "facebook.com", "twitter.com", "netflix.com", "linkedin.com", "youtube.com"]
-        domains = []
-
-        for i in range(num_domains):
-            if i < len(real):  # First 10 are real domains
-                domains.append((real[i],))
-            else:
-                domains.append((f"testllc{i:08d}.com",))
-
-        conn.executemany(
-            "INSERT INTO domain_variations (domain) VALUES (?)",
-            domains
+    conn = duckdb.connect(str(test_db))
+    conn.execute("""
+        CREATE TABLE domain_variations (
+            domain VARCHAR PRIMARY KEY
         )
+    """)
+
+    # Generate mix of real and fake domains
+    real = ["google.com", "amazon.com", "microsoft.com", "github.com", "apple.com",
+            "facebook.com", "twitter.com", "netflix.com", "linkedin.com", "youtube.com"]
+    domains = []
+
+    for i in range(num_domains):
+        if i < len(real):  # First 10 are real domains
+            domains.append((real[i],))
+        else:
+            domains.append((f"testllc{i:08d}.com",))
+
+    conn.executemany(
+        "INSERT INTO domain_variations (domain) VALUES (?)",
+        domains
+    )
+    conn.close()
 
     print(f"Created test database with {num_domains} domains: {test_db}")
     return test_db
@@ -205,12 +243,12 @@ def create_test_database(num_domains: int = 1000) -> Path:
 # Test
 if __name__ == "__main__":
     print("=" * 60)
-    print("DATABASE INTEGRATION TEST")
+    print("DATABASE INTEGRATION TEST (DuckDB)")
     print("=" * 60)
 
     # Create test database
     test_variations = create_test_database(1000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_checks.db")
+    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_checks.duckdb")
 
     # Remove old checks if exists
     if test_checks.exists():
@@ -255,6 +293,9 @@ if __name__ == "__main__":
     unchecked = db.get_unchecked_domains(batch_size=10)
     print(f"\nUnchecked domains (first 10): {len(unchecked)}")
     print(f"  {unchecked[:5]}")
+
+    # Cleanup
+    db.close()
 
     print("\n" + "=" * 60)
     print("DATABASE INTEGRATION TEST PASSED")

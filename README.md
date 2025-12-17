@@ -1,43 +1,50 @@
-# Domain Availability Checker
+# High-Performance Domain Availability Checker
 
-High-performance domain availability checker using WHOIS protocol with proxy rotation. Designed to check 580M+ domain variations efficiently.
+A massively scalable domain availability checker using the WHOIS protocol with proxy rotation. Designed to check **700M+ domains** efficiently.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Throughput | **3,700 domains/sec** |
-| Success Rate | 100% |
-| 580M domains | ~44 hours (~1.8 days) |
-| Bandwidth | ~130 GB |
+| **Throughput** | 3,700 domains/sec |
+| **Success Rate** | 100% |
+| **704M domains** | ~53 hours (~2.2 days) |
+| **Bandwidth** | ~157 GB total |
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     DOMAIN VARIATIONS DB                     │
-│              (580M domains from LLC name generator)          │
+│                   DOMAIN VARIATIONS DB                       │
+│                (DuckDB - 704M+ domains)                      │
 └───────────────────────────┬─────────────────────────────────┘
                             │
                      ┌──────▼──────┐
                      │   DOMAIN    │
-                     │  CHECKER    │
+                     │   CHECKER   │
                      │             │
-                     │ 1000 proxies│
-                     │ 1 conn each │
+                     │ Batch: 10K  │
+                     │ Checkpoint  │
                      └──────┬──────┘
+                            │
+              ┌─────────────┼─────────────┐
+              │             │             │
+        ┌─────▼─────┐ ┌─────▼─────┐ ┌─────▼─────┐
+        │  PROXY 1  │ │  PROXY 2  │ │ PROXY N   │
+        │  1 conn   │ │  1 conn   │ │  1 conn   │
+        └─────┬─────┘ └─────┬─────┘ └─────┬─────┘
+              │             │             │
+              └─────────────┼─────────────┘
                             │
                      ┌──────▼──────┐
                      │   WHOIS     │
-                     │  CHECKER    │
-                     │             │
-                     │ 64B response│
-                     │ Retry logic │
+                     │   SERVER    │
+                     │ (Verisign)  │
                      └──────┬──────┘
                             │
                      ┌──────▼──────┐
                      │   RESULTS   │
-                     │   (SQLite)  │
+                     │  (DuckDB)   │
                      └─────────────┘
 ```
 
@@ -49,66 +56,75 @@ High-performance domain availability checker using WHOIS protocol with proxy rot
 
 ### 2. Minimal Response Reading
 - Only reads first **64 bytes** of WHOIS response
-- Status detection in first 16 bytes:
+- Status detection in first bytes:
   - `"No match"` → Available
   - `"Domain Name"` → Taken
 
 ### 3. Optimal Concurrency
-- **1 connection per proxy** (bottleneck analysis revealed per-proxy limits)
+- **1 connection per proxy** (bottleneck analysis confirmed this is optimal)
 - 1000 proxies = 1000 concurrent connections
 - Higher per-proxy concurrency causes failures
 
-### 4. Proxy Pool with Health Tracking
-- Automatic proxy rotation
-- Health-based proxy selection
-- Retry with different proxy on failure
+### 4. Checkpoint/Resume System
+- Saves progress every 100K domains (~27 seconds)
+- Automatic resume on restart
+- No duplicate checks
+
+## Data Usage
+
+| Component | Bytes/Query |
+|-----------|-------------|
+| CONNECT request (sent) | ~107 |
+| WHOIS query (sent) | ~21 |
+| CONNECT response (recv) | ~39 |
+| WHOIS response (recv) | 64 |
+| **Total** | **~239** |
+
+**704M domains = ~157 GB total bandwidth**
 
 ## Installation
 
+### Local Development
+
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/domain-checker.git
-cd domain-checker
+git clone <repo-url>
+cd rdap_test
 
 # Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
 
 # Install dependencies
-pip install httpx uvloop
+pip install -r requirements.txt
 ```
 
-## Usage
+### Docker (Recommended for Production)
 
-### Quick Test (100 domains, 1 proxy)
 ```bash
-cd src
-python whois_checker.py --test 100
-```
+# Build the image
+docker build -t domain-checker .
 
-### Multi-Proxy Test (1000 domains, 50 proxies)
-```bash
-python whois_checker.py --test 1000 --proxies 50
-```
-
-### Database Integration Test
-```bash
-python domain_checker.py --test
-```
-
-### Checkpoint/Resume Test
-```bash
-python domain_checker.py --test-resume
-```
-
-### Full Scale Test (100K domains)
-```bash
-python domain_checker.py --test-100k
+# Or use docker-compose
+docker-compose up -d
 ```
 
 ## Configuration
 
-Create a proxy file at the path specified in the code (or modify `PROXY_FILE` path):
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `VARIATIONS_DB` | Path to domain variations DuckDB | Required |
+| `CHECKS_DB` | Path to results DuckDB | Required |
+| `PROXY_FILE` | Path to proxy list file | Required |
+| `BATCH_SIZE` | Domains per batch | 10000 |
+| `CHECKPOINT_INTERVAL` | Save checkpoint every N domains | 100000 |
+| `MAX_PROXIES` | Limit number of proxies | All |
+| `LIMIT` | Max domains to check | All |
+| `RESUME` | Resume from checkpoint | true |
+
+### Proxy File Format
 
 ```
 user1:pass1@ip1:port1
@@ -116,45 +132,146 @@ user2:pass2@ip2:port2
 ...
 ```
 
+## Usage
+
+### Production Run (Docker)
+
+1. Create a `data/` directory with:
+   - `domain_variations.duckdb` - Your domain source database
+   - `proxies.txt` - Your proxy list
+
+2. Run with docker-compose:
+```bash
+docker-compose up -d
+```
+
+3. Monitor logs:
+```bash
+docker-compose logs -f
+```
+
+### Production Run (Local)
+
+```bash
+export VARIATIONS_DB=/path/to/domain_variations.duckdb
+export CHECKS_DB=/path/to/domain_checks.duckdb
+export PROXY_FILE=/path/to/proxies.txt
+
+cd src
+python domain_checker.py --run
+```
+
+### Test Runs
+
+```bash
+cd src
+
+# Small test (1K domains)
+python domain_checker.py --test
+
+# Checkpoint/resume test (2K domains)
+python domain_checker.py --test-resume
+
+# Larger test (100K domains)
+python domain_checker.py --test-100k
+```
+
 ## Project Structure
 
 ```
-domain-checker/
+rdap_test/
 ├── src/
-│   ├── whois_checker.py    # Core WHOIS checker with optimizations
+│   ├── whois_checker.py    # Core WHOIS checker (64-byte optimization)
 │   ├── proxy_pool.py       # Proxy management with health tracking
-│   ├── database.py         # SQLite integration for results
+│   ├── database.py         # DuckDB integration for results
 │   └── domain_checker.py   # Main orchestrator with checkpointing
-├── tests/
-│   ├── test_rdap.py        # Basic RDAP tests
-│   ├── test_whois.py       # Basic WHOIS tests
-│   └── ...                 # Protocol comparison tests
-├── benchmarks/
-│   ├── bottleneck_analysis.py   # Find optimal concurrency
-│   ├── compare_protocols.py     # RDAP vs WHOIS comparison
-│   └── ...                      # Performance benchmarks
+├── tests/                  # Protocol and integration tests
+├── benchmarks/             # Performance analysis scripts
+├── Dockerfile              # Container configuration
+├── docker-compose.yml      # Easy deployment
+├── .env.example            # Environment variable template
+├── requirements.txt        # Python dependencies
 └── README.md
 ```
 
+## Database Schema
+
+### Source Database (domain_variations.duckdb)
+
+Expected table: `domain_variations`
+```sql
+domain VARCHAR  -- The domain to check (e.g., 'example.com')
+```
+
+### Results Database (domain_checks.duckdb)
+
+Created automatically:
+```sql
+CREATE TABLE domain_checks (
+    domain VARCHAR PRIMARY KEY,
+    status VARCHAR NOT NULL,  -- 'taken', 'available', 'error', 'unknown'
+    error VARCHAR,
+    checked_at TIMESTAMP
+);
+
+CREATE TABLE checkpoints (
+    id INTEGER PRIMARY KEY,
+    last_offset BIGINT,
+    total_checked BIGINT,
+    updated_at TIMESTAMP
+);
+```
+
+## Scaling Estimates
+
+| Proxies | Throughput | 704M Runtime |
+|---------|------------|--------------|
+| 100 | 370/sec | 22 days |
+| 250 | 925/sec | 8.8 days |
+| 500 | 1,850/sec | 4.4 days |
+| 750 | 2,775/sec | 2.9 days |
+| **1000** | **3,700/sec** | **2.2 days** |
+| 1500+ | 5,000/sec* | 1.6 days |
+
+*Capped by Verisign rate limits
+
 ## Bottleneck Analysis
 
-Found that **per-proxy concurrency** is the limiting factor:
+The system was optimized through iterative testing:
 
-| Proxies | Per-Proxy | Throughput | Success |
-|---------|-----------|------------|---------|
-| 50 | 10 | 175/sec | 81.7% |
-| 500 | 1 | **2,947/sec** | **100%** |
+1. **Per-proxy concurrency**: Testing showed 1 connection per proxy is optimal. Higher concurrency per proxy causes connection failures.
 
-Optimal: Use all proxies with 1 connection each.
+2. **Protocol choice**: WHOIS chosen over RDAP for 1.7x speed improvement and 5x bandwidth reduction.
 
-## Protocol Comparison
+3. **Response reading**: Only 64 bytes needed to determine availability status.
 
-| Protocol | Latency | Bandwidth/query | Connection Reuse |
-|----------|---------|-----------------|------------------|
-| WHOIS | ~130ms | 64 bytes | No (server closes) |
-| RDAP | ~200ms | 400+ bytes | No |
+4. **Server limits**: Verisign caps total throughput at ~5,000/sec regardless of proxy count.
 
-WHOIS was chosen for production due to lower latency and bandwidth.
+## Deployment Checklist
+
+- [ ] Copy `domain_variations.duckdb` to target machine
+- [ ] Create proxy list file with valid proxies
+- [ ] Set environment variables or create `.env` file
+- [ ] Build Docker image or install Python dependencies
+- [ ] Run initial test with `--test` flag
+- [ ] Start production run with `--run` flag
+- [ ] Monitor logs for errors
+
+## Troubleshooting
+
+### High Error Rate
+- Check proxy health (proxies may be rate-limited or banned)
+- Reduce `MAX_PROXIES` to use fewer, healthier proxies
+- Check network connectivity
+
+### Slow Throughput
+- Increase proxy count
+- Verify proxies are geographically distributed
+- Check for network bottlenecks
+
+### Resume Not Working
+- Ensure `CHECKS_DB` path is consistent between runs
+- Check that checkpoint table exists in results database
 
 ## License
 
