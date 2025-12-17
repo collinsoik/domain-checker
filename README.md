@@ -84,7 +84,7 @@ A massively scalable domain availability checker using the WHOIS protocol with p
 
 ## Installation
 
-### Local Development
+### Local Development (Linux/macOS)
 
 ```bash
 # Clone the repo
@@ -99,13 +99,39 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Docker (Recommended for Production)
+### Local Development (Windows)
+
+```powershell
+# Clone the repo
+git clone <repo-url>
+cd rdap_test
+
+# Create virtual environment
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### Docker - Linux (Recommended for Production)
 
 ```bash
-# Build the image
-docker build -t domain-checker .
+# Build the Linux image
+docker build -f Dockerfile.linux -t domain-checker .
 
 # Or use docker-compose
+docker-compose up -d
+```
+
+### Docker - Windows
+
+```powershell
+# Build the Windows image (requires Windows containers mode)
+docker build -f Dockerfile.windows -t domain-checker .
+
+# Or use docker-compose
+$env:DOCKERFILE="Dockerfile.windows"
 docker-compose up -d
 ```
 
@@ -150,12 +176,23 @@ docker-compose up -d
 docker-compose logs -f
 ```
 
-### Production Run (Local)
+### Production Run (Local - Linux/macOS)
 
 ```bash
 export VARIATIONS_DB=/path/to/domain_variations.duckdb
 export CHECKS_DB=/path/to/domain_checks.duckdb
 export PROXY_FILE=/path/to/proxies.txt
+
+cd src
+python domain_checker.py --run
+```
+
+### Production Run (Local - Windows)
+
+```powershell
+$env:VARIATIONS_DB="C:\data\domain_variations.duckdb"
+$env:CHECKS_DB="C:\data\domain_checks.duckdb"
+$env:PROXY_FILE="C:\data\proxies.txt"
 
 cd src
 python domain_checker.py --run
@@ -185,10 +222,15 @@ rdap_test/
 │   ├── proxy_pool.py       # Proxy management with health tracking
 │   ├── database.py         # DuckDB integration for results
 │   └── domain_checker.py   # Main orchestrator with checkpointing
+├── data/                   # Data directory (mount point for Docker)
+│   ├── domain_variations.duckdb  # Source database (704M domains)
+│   ├── domain_checks.duckdb      # Results database (created on run)
+│   └── proxies.txt               # Proxy list file
 ├── tests/                  # Protocol and integration tests
 ├── benchmarks/             # Performance analysis scripts
-├── Dockerfile              # Container configuration
-├── docker-compose.yml      # Easy deployment
+├── Dockerfile.linux        # Linux container configuration
+├── Dockerfile.windows      # Windows container configuration
+├── docker-compose.yml      # Easy deployment (auto-selects platform)
 ├── .env.example            # Environment variable template
 ├── requirements.txt        # Python dependencies
 └── README.md

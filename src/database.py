@@ -19,13 +19,16 @@ from datetime import datetime
 
 
 # Default paths (can be overridden by environment variables)
+# Uses relative paths from src/ -> data/ for cross-platform compatibility
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
+
 VARIATIONS_DUCKDB = Path(os.environ.get(
     "VARIATIONS_DB",
-    "/Users/collinsoik/Desktop/Code_Space/rdap_test/domain_variations.duckdb"
+    str(_DEFAULT_DATA_DIR / "domain_variations.duckdb")
 ))
 CHECKS_DUCKDB = Path(os.environ.get(
     "CHECKS_DB",
-    "/Users/collinsoik/Desktop/Code_Space/rdap_test/domain_checks.duckdb"
+    str(_DEFAULT_DATA_DIR / "domain_checks.duckdb")
 ))
 
 
@@ -206,7 +209,7 @@ class DomainDatabase:
 
 def create_test_database(num_domains: int = 1000) -> Path:
     """Create a test variations database for testing (DuckDB format)."""
-    test_db = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_variations.duckdb")
+    test_db = Path(__file__).parent.parent / "test_variations.duckdb"
 
     # Remove if exists
     if test_db.exists():
@@ -248,7 +251,7 @@ if __name__ == "__main__":
 
     # Create test database
     test_variations = create_test_database(1000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_checks.duckdb")
+    test_checks = Path(__file__).parent.parent / "test_checks.duckdb"
 
     # Remove old checks if exists
     if test_checks.exists():

@@ -14,7 +14,9 @@ from typing import Optional
 import random
 
 
-PROXY_FILE = Path("/Users/collinsoik/Desktop/Code_Space/Proxy Status Checker/proxies.txt")
+# Default proxy file path (cross-platform)
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
+PROXY_FILE = _DEFAULT_DATA_DIR / "proxies.txt"
 
 
 @dataclass

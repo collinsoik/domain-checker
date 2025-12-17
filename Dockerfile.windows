@@ -1,0 +1,28 @@
+# Windows Server Core container for domain checker
+# Requires Windows containers mode in Docker Desktop
+
+FROM python:3.11-windowsservercore
+
+WORKDIR C:\\app
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY src\ .\src\
+
+# Create data directory for mounted volumes
+RUN mkdir C:\data
+
+# Default environment variables (Windows paths)
+ENV VARIATIONS_DB=C:\data\domain_variations.duckdb
+ENV CHECKS_DB=C:\data\domain_checks.duckdb
+ENV PROXY_FILE=C:\data\proxies.txt
+ENV RESUME=true
+ENV BATCH_SIZE=10000
+ENV CHECKPOINT_INTERVAL=100000
+
+# Run the domain checker
+WORKDIR C:\\app\\src
+CMD ["python", "domain_checker.py", "--run"]

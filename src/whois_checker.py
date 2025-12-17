@@ -36,9 +36,12 @@ WHOIS_PORT = 43
 RESPONSE_BYTES = 64  # Need enough to detect "No match for" or "Domain Name"
 TIMEOUT = 10
 
+# Default proxy file path (cross-platform)
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
+
 PROXY_FILE = Path(os.environ.get(
     "PROXY_FILE",
-    "/Users/collinsoik/Desktop/Code_Space/Proxy Status Checker/proxies.txt"
+    str(_DEFAULT_DATA_DIR / "proxies.txt")
 ))
 
 

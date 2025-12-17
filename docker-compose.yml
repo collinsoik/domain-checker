@@ -1,8 +1,15 @@
 version: '3.8'
 
+# Platform selection:
+#   Linux (default):  docker-compose up
+#   Windows:          DOCKERFILE=Dockerfile.windows docker-compose up
+#                     (PowerShell: $env:DOCKERFILE="Dockerfile.windows"; docker-compose up)
+
 services:
   domain-checker:
-    build: .
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile.linux}
     container_name: domain-checker
     restart: unless-stopped
     volumes:
