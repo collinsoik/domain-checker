@@ -1,63 +1,64 @@
 #!/bin/bash
-# Domain checker progress monitor
+# Domain Checker Monitor - Live updating dashboard
+# Usage: ./monitor.sh
 
-INTERVAL=${1:-10}  # Default 10 second sample
+# Hide cursor and setup clean exit
+tput civis
+trap 'tput cnorm; exit' INT TERM
 
-echo "Sampling for ${INTERVAL}s..."
+# Clear screen once at start
+clear
 
-# First sample
-cp data/domain_checks.duckdb /tmp/checks_copy.duckdb 2>/dev/null
-cp data/domain_checks.duckdb.wal /tmp/checks_copy.duckdb.wal 2>/dev/null
-COUNT1=$(sg docker -c "docker run --rm -v /tmp:/tmp domain-checker-domain-checker python -c \"
-import duckdb
-conn = duckdb.connect('/tmp/checks_copy.duckdb', read_only=True)
-print(conn.execute('SELECT COUNT(*) FROM domain_checks').fetchone()[0])
-\"" 2>/dev/null)
+while true; do
+    # Move cursor to top-left instead of clearing (smoother)
+    tput cup 0 0
 
-sleep $INTERVAL
+    # Get latest log line
+    LINE=$(sg docker -c "docker logs domain-checker --tail 1" 2>&1)
 
-# Second sample
-cp data/domain_checks.duckdb /tmp/checks_copy.duckdb 2>/dev/null
-cp data/domain_checks.duckdb.wal /tmp/checks_copy.duckdb.wal 2>/dev/null
-COUNT2=$(sg docker -c "docker run --rm -v /tmp:/tmp domain-checker-domain-checker python -c \"
-import duckdb
-conn = duckdb.connect('/tmp/checks_copy.duckdb', read_only=True)
-print(conn.execute('SELECT COUNT(*) FROM domain_checks').fetchone()[0])
-\"" 2>/dev/null)
+    echo "╔══════════════════════════════════════════╗"
+    echo "║       Domain Checker Monitor             ║"
+    echo "╠══════════════════════════════════════════╣"
 
-TOTAL=704023090
+    if [[ $LINE == *"Batch:"* ]]; then
+        # Extract metrics
+        BATCH_SPEED=$(echo "$LINE" | grep -oP '\d+/sec' | head -1 | grep -oP '\d+')
+        OVERALL_SPEED=$(echo "$LINE" | grep -oP 'Overall: \d+/sec' | grep -oP '\d+')
+        CHECKED=$(echo "$LINE" | grep -oP 'Total: [\d,]+' | grep -oP '[\d,]+' | tr -d ',')
+        TOTAL=704023090
+        PCT=$(echo "$LINE" | grep -oP '\([\d.]+%\)' | tr -d '()')
+        ERRORS=$(echo "$LINE" | grep -oP 'E:\d+' | grep -oP '\d+')
+        CONCURRENCY=$(echo "$LINE" | grep -oP 'C:\d+' | grep -oP '\d+')
 
-# Calculate rate
-DIFF=$((COUNT2 - COUNT1))
-RATE=$(echo "scale=1; $DIFF / $INTERVAL" | bc)
-REMAINING=$((TOTAL - COUNT2))
-ETA_SECS=$(echo "scale=0; $REMAINING / ($DIFF / $INTERVAL)" | bc 2>/dev/null)
-ETA_HOURS=$(echo "scale=1; $ETA_SECS / 3600" | bc 2>/dev/null)
-ETA_DAYS=$(echo "scale=2; $ETA_HOURS / 24" | bc 2>/dev/null)
-PCT=$(echo "scale=4; $COUNT2 * 100 / $TOTAL" | bc)
+        # Calculate ETA
+        if [[ -n "$BATCH_SPEED" && "$BATCH_SPEED" -gt 0 ]]; then
+            REMAINING=$((TOTAL - CHECKED))
+            ETA_SECS=$((REMAINING / BATCH_SPEED))
+            ETA_HOURS=$((ETA_SECS / 3600))
+            ETA_DAYS=$(echo "scale=1; $ETA_HOURS / 24" | bc)
+        else
+            ETA_DAYS="--"
+            ETA_HOURS="--"
+        fi
 
-# Get status breakdown
-STATS=$(sg docker -c "docker run --rm -v /tmp:/tmp domain-checker-domain-checker python -c \"
-import duckdb
-conn = duckdb.connect('/tmp/checks_copy.duckdb', read_only=True)
-avail = conn.execute(\\\"SELECT COUNT(*) FROM domain_checks WHERE status='available'\\\").fetchone()[0]
-taken = conn.execute(\\\"SELECT COUNT(*) FROM domain_checks WHERE status='taken'\\\").fetchone()[0]
-print(f'{avail},{taken}')
-\"" 2>/dev/null)
+        printf "║  Batch Speed:   %-6s/sec              ║\n" "$BATCH_SPEED"
+        printf "║  Overall Speed: %-6s/sec              ║\n" "$OVERALL_SPEED"
+        echo "╠══════════════════════════════════════════╣"
+        printf "║  Progress: %'12d / %'d   ║\n" "$CHECKED" "$TOTAL"
+        printf "║  Complete: %-6s                       ║\n" "$PCT"
+        echo "╠══════════════════════════════════════════╣"
+        printf "║  ETA: %-5s days (%-5s hours)          ║\n" "$ETA_DAYS" "$ETA_HOURS"
+        printf "║  Errors: %-4s  Concurrency: %-4s        ║\n" "$ERRORS" "$CONCURRENCY"
+    else
+        printf "║  %-40s ║\n" "${LINE:0:40}"
+    fi
 
-AVAIL=$(echo $STATS | cut -d',' -f1)
-TAKEN=$(echo $STATS | cut -d',' -f2)
+    echo "╚══════════════════════════════════════════╝"
+    echo ""
+    echo "  (Ctrl+C to exit)"
 
-echo ""
-echo "============================================"
-echo "  DOMAIN CHECKER PROGRESS"
-echo "============================================"
-printf "  Checked:    %'d / %'d (${PCT}%%)\n" $COUNT2 $TOTAL
-printf "  Available:  %'d\n" $AVAIL
-printf "  Taken:      %'d\n" $TAKEN
-echo "--------------------------------------------"
-printf "  Rate:       %s domains/sec\n" $RATE
-printf "  ETA:        %.1f hours (%.2f days)\n" $ETA_HOURS $ETA_DAYS
-echo "============================================"
-echo ""
-echo "Target: 2,700-4,000/sec for 2-3 day completion"
+    # Clear any leftover lines
+    tput el
+
+    sleep 2
+done

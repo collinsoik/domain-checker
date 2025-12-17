@@ -82,40 +82,50 @@ class WHOISChecker:
 
     async def create_tunnel(self, proxy: dict) -> tuple:
         """Create HTTP CONNECT tunnel to WHOIS server."""
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(proxy["host"], proxy["port"]),
-            timeout=TIMEOUT
-        )
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(proxy["host"], proxy["port"]),
+                timeout=TIMEOUT
+            )
 
-        # Minimal CONNECT request
-        auth = base64.b64encode(f"{proxy['user']}:{proxy['pass']}".encode()).decode()
-        connect_req = (
-            f"CONNECT {WHOIS_SERVER}:{WHOIS_PORT} HTTP/1.1\r\n"
-            f"Proxy-Authorization: Basic {auth}\r\n"
-            f"\r\n"
-        )
+            # Minimal CONNECT request
+            auth = base64.b64encode(f"{proxy['user']}:{proxy['pass']}".encode()).decode()
+            connect_req = (
+                f"CONNECT {WHOIS_SERVER}:{WHOIS_PORT} HTTP/1.1\r\n"
+                f"Proxy-Authorization: Basic {auth}\r\n"
+                f"\r\n"
+            )
 
-        writer.write(connect_req.encode())
-        await writer.drain()
-        self.stats.bytes_sent += len(connect_req)
+            writer.write(connect_req.encode())
+            await asyncio.wait_for(writer.drain(), timeout=TIMEOUT)
+            self.stats.bytes_sent += len(connect_req)
 
-        # Read CONNECT response
-        response = await asyncio.wait_for(reader.readline(), timeout=TIMEOUT)
-        self.stats.bytes_received += len(response)
+            # Read CONNECT response
+            response = await asyncio.wait_for(reader.readline(), timeout=TIMEOUT)
+            self.stats.bytes_received += len(response)
 
-        if b"200" not in response:
-            writer.close()
-            raise ConnectionError(f"CONNECT failed: {response.decode().strip()}")
+            if b"200" not in response:
+                raise ConnectionError(f"CONNECT failed: {response.decode().strip()}")
 
-        # Drain remaining headers
-        while True:
-            line = await reader.readline()
-            self.stats.bytes_received += len(line)
-            if line in (b"\r\n", b"\n", b""):
-                break
+            # Drain remaining headers
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=TIMEOUT)
+                self.stats.bytes_received += len(line)
+                if line in (b"\r\n", b"\n", b""):
+                    break
 
-        self.stats.tunnels_created += 1
-        return reader, writer
+            self.stats.tunnels_created += 1
+            return reader, writer
+        except:
+            # Clean up on any failure
+            if writer is not None:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=TIMEOUT)
+                except:
+                    pass
+            raise
 
     async def check_single(self, reader, writer, domain: str) -> Result:
         """Check single domain through existing tunnel."""
@@ -160,6 +170,7 @@ class WHOISChecker:
         Check single domain - creates new tunnel for each query.
         WHOIS does not support connection reuse.
         """
+        writer = None
         try:
             # Create tunnel
             reader, writer = await self.create_tunnel(proxy)
@@ -167,7 +178,7 @@ class WHOISChecker:
             # Send query
             query = f"{domain}\r\n"
             writer.write(query.encode())
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=TIMEOUT)
             self.stats.bytes_sent += len(query)
 
             # Read response
@@ -176,13 +187,6 @@ class WHOISChecker:
                 timeout=TIMEOUT
             )
             self.stats.bytes_received += len(response)
-
-            # Close tunnel
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except:
-                pass
 
             self.stats.total += 1
 
@@ -205,6 +209,14 @@ class WHOISChecker:
             self.stats.total += 1
             self.stats.errors += 1
             return Result(domain, "error", str(e))
+        finally:
+            # Always close the writer if it was created
+            if writer is not None:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=TIMEOUT)
+                except:
+                    pass
 
     async def check_batch(self, domains: list[str], proxy: dict) -> list[Result]:
         """
