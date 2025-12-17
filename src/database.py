@@ -142,18 +142,49 @@ class DomainDatabase:
         return [row[0] for row in results]
 
     def save_results(self, results: list[DomainResult]):
-        """Save batch of results to database."""
+        """Save batch of results to database using efficient bulk insert."""
         if not results:
             return
 
         conn = self._get_checks_conn()
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO domain_checks (domain, status, error, checked_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            [(r.domain, r.status, r.error) for r in results]
-        )
+
+        # Convert to list of tuples for bulk insert
+        data = [(r.domain, r.status, r.error) for r in results]
+
+        # Use DuckDB's efficient bulk insert via VALUES clause
+        # This is much faster than executemany for large batches
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            # Create temp table with the data
+            conn.execute("""
+                CREATE TEMP TABLE IF NOT EXISTS temp_results (
+                    domain VARCHAR,
+                    status VARCHAR,
+                    error VARCHAR
+                )
+            """)
+            conn.execute("DELETE FROM temp_results")
+
+            # Bulk insert into temp table
+            conn.executemany(
+                "INSERT INTO temp_results VALUES (?, ?, ?)",
+                data
+            )
+
+            # Upsert from temp to main table
+            conn.execute("""
+                INSERT INTO domain_checks (domain, status, error, checked_at)
+                SELECT domain, status, error, CURRENT_TIMESTAMP FROM temp_results
+                ON CONFLICT (domain) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    error = EXCLUDED.error,
+                    checked_at = EXCLUDED.checked_at
+            """)
+
+            conn.execute("COMMIT")
+        except Exception as e:
+            conn.execute("ROLLBACK")
+            raise e
 
     def save_checkpoint(self, offset: int, total_checked: int):
         """Save checkpoint for resume."""

@@ -13,18 +13,24 @@ services:
     container_name: domain-checker
     restart: unless-stopped
     volumes:
-      # Mount data directory containing:
-      # - domain_variations.duckdb (read-only source)
-      # - domain_checks.duckdb (results - will be created)
-      # - proxies.txt (proxy list)
+      # Mount data directory for results
       - ./data:/data
+      # Mount the source database directly (read-only)
+      - ../domain_variations.duckdb:/data/domain_variations.duckdb:ro
+      # Mount proxies
+      - ../proxies.txt:/data/proxies.txt:ro
     environment:
+      - PYTHONUNBUFFERED=1
       - VARIATIONS_DB=/data/domain_variations.duckdb
       - CHECKS_DB=/data/domain_checks.duckdb
       - PROXY_FILE=/data/proxies.txt
       - RESUME=true
       - BATCH_SIZE=10000
       - CHECKPOINT_INTERVAL=100000
+      # Adaptive rate control (optimized)
+      - RATE_INITIAL_CONCURRENCY=500
+      - RATE_MAX_CONCURRENCY=800
+      - RATE_MIN_CONCURRENCY=50
       # Optional: limit proxies or domains
       # - MAX_PROXIES=500
       # - LIMIT=1000000

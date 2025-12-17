@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Iteration 4-7: Complete Domain Checker
+Iteration 4-8: Complete Domain Checker with Adaptive Rate Control
 
 Integrates:
 - WHOIS checker (Iteration 1)
 - Proxy pool (Iteration 2)
 - Database integration (Iteration 4)
 - Checkpointing (Iteration 5)
+- Adaptive rate control (Iteration 8)
 """
 
 import asyncio
@@ -25,6 +26,8 @@ except ImportError:
 from whois_checker import WHOISChecker, Result
 from proxy_pool import ProxyPool
 from database import DomainDatabase, DomainResult, create_test_database
+from metrics import RollingMetrics
+from rate_controller import AdaptiveRateController, ControllerConfig, ControllerState
 
 
 # Configuration
@@ -32,32 +35,58 @@ BATCH_SIZE = 10000
 CHECKPOINT_INTERVAL = 100000
 CONCURRENCY_PER_PROXY = 1  # OPTIMAL: 1 connection per proxy (proxies are the bottleneck)
 MAX_RETRIES = 2  # Retry failed domains
+ADAPTIVE_MODE = True  # Enable adaptive rate control
 
 # Bottleneck Analysis Results:
 # - Per-proxy limit: ~1-2 concurrent connections per proxy
 # - Optimal total concurrency: ~1000 (matches proxy count)
-# - Expected throughput: ~3,500/sec at 100% success
-# - Projected time for 580M: ~46 hours (~2 days)
+# - Verisign rate limiting: ~4000/sec burst, ~700/sec sustained
+# - Adaptive control target: ~1000/sec sustained
 
 
 class DomainChecker:
-    """Complete domain checking system."""
+    """Complete domain checking system with adaptive rate control."""
 
     def __init__(
         self,
         variations_db: Path,
         checks_db: Path,
         proxy_file: Path,
-        max_proxies: Optional[int] = None
+        max_proxies: Optional[int] = None,
+        adaptive: bool = ADAPTIVE_MODE
     ):
         self.db = DomainDatabase(variations_db, checks_db)
         self.pool = ProxyPool(proxy_file, max_proxies)
         self.checker = WHOISChecker()
+        self.adaptive = adaptive
 
         # Stats
         self.start_time = None
         self.domains_checked = 0
         self.last_checkpoint = 0
+
+        # Adaptive rate control
+        if self.adaptive:
+            import os
+            self.metrics = RollingMetrics(
+                latency_window=100,
+                timeout_window=1000,
+                throughput_window=10.0
+            )
+            # Configure from env vars or use defaults based on proxy count
+            default_max = min(len(self.pool) * 2, 500)
+            default_initial = min(len(self.pool), 300)
+            self.controller = AdaptiveRateController(ControllerConfig(
+                min_concurrency=int(os.environ.get("RATE_MIN_CONCURRENCY", 50)),
+                max_concurrency=int(os.environ.get("RATE_MAX_CONCURRENCY", default_max)),
+                initial_concurrency=int(os.environ.get("RATE_INITIAL_CONCURRENCY", default_initial)),
+                latency_low_ms=float(os.environ.get("RATE_LATENCY_LOW_MS", 120)),
+                latency_high_ms=float(os.environ.get("RATE_LATENCY_HIGH_MS", 200)),
+                timeout_high=float(os.environ.get("RATE_TIMEOUT_HIGH", 0.02)),
+            ))
+        else:
+            self.metrics = None
+            self.controller = None
 
     async def check_domain(self, domain: str, proxy) -> DomainResult:
         """Check single domain and return result."""
@@ -76,13 +105,21 @@ class DomainChecker:
             error=result.error
         )
 
-    async def check_batch(self, domains: list[str], concurrency: int = 100) -> list[DomainResult]:
-        """Check batch of domains in parallel with retry logic."""
+    async def check_batch(self, domains: list[str], concurrency: int = 100) -> tuple[list[DomainResult], list[float]]:
+        """
+        Check batch of domains in parallel with retry logic.
+
+        Returns:
+            Tuple of (results, latencies) for metrics tracking
+        """
         sem = asyncio.Semaphore(concurrency)
         proxies = self.pool.get_healthy_proxies()
+        latencies = []  # Track latencies for adaptive control
 
-        async def check_with_retry(domain: str, proxy_idx: int) -> DomainResult:
+        async def check_with_retry(domain: str, proxy_idx: int) -> tuple[DomainResult, float]:
             async with sem:
+                query_start = time.perf_counter()
+
                 # Try with primary proxy
                 proxy = proxies[proxy_idx % len(proxies)]
                 result = await self.check_domain(domain, proxy)
@@ -95,12 +132,25 @@ class DomainChecker:
                     proxy = proxies[(proxy_idx + retry + 1) % len(proxies)]
                     result = await self.check_domain(domain, proxy)
 
-                return result
+                latency_ms = (time.perf_counter() - query_start) * 1000
+                return result, latency_ms
 
         # Distribute domains across proxies
         tasks = [check_with_retry(domain, i) for i, domain in enumerate(domains)]
-        results = await asyncio.gather(*tasks)
-        return list(results)
+        results_with_latency = await asyncio.gather(*tasks)
+
+        # Separate results and latencies
+        results = []
+        for result, latency in results_with_latency:
+            results.append(result)
+            latencies.append(latency)
+
+            # Record metrics for adaptive control
+            if self.metrics:
+                is_timeout = result.status == "error" and result.error == "timeout"
+                self.metrics.record(latency, is_timeout)
+
+        return results, latencies
 
     async def run(
         self,
@@ -109,7 +159,7 @@ class DomainChecker:
         limit: Optional[int] = None,
         resume: bool = False
     ):
-        """Run the domain checker."""
+        """Run the domain checker with adaptive rate control."""
         self.start_time = time.perf_counter()
 
         # Get starting point
@@ -127,12 +177,26 @@ class DomainChecker:
         print(f"\nTotal domains to check: {total_domains:,}")
         print(f"Using {len(self.pool)} proxies")
         print(f"Batch size: {batch_size}")
+        print(f"Adaptive mode: {self.adaptive}")
+        if self.adaptive:
+            print(f"Initial concurrency: {self.controller.get_concurrency()}")
         print("-" * 60)
 
-        # Calculate concurrency
-        concurrency = len(self.pool) * CONCURRENCY_PER_PROXY
+        # Calculate initial concurrency
+        if self.adaptive:
+            concurrency = self.controller.get_concurrency()
+        else:
+            concurrency = len(self.pool) * CONCURRENCY_PER_PROXY
 
         while self.domains_checked < total_domains:
+            # Check for pause (adaptive mode)
+            if self.adaptive and self.controller.should_pause():
+                pause_remaining = self.controller.get_pause_remaining()
+                print(f"  [RATE LIMITED - Pausing {pause_remaining:.0f}s...]")
+                await asyncio.sleep(pause_remaining)
+                concurrency = self.controller.get_concurrency()
+                print(f"  [Resumed with concurrency={concurrency}]")
+
             # Get next batch
             remaining = total_domains - self.domains_checked
             current_batch_size = min(batch_size, remaining)
@@ -147,7 +211,7 @@ class DomainChecker:
 
             # Check batch
             batch_start = time.perf_counter()
-            results = await self.check_batch(domains, concurrency=concurrency)
+            results, latencies = await self.check_batch(domains, concurrency=concurrency)
             batch_time = time.perf_counter() - batch_start
 
             # Save results
@@ -156,6 +220,15 @@ class DomainChecker:
             # Update progress
             self.domains_checked += len(results)
             offset += len(domains)
+
+            # Update adaptive controller
+            if self.adaptive:
+                self.controller.record_queries(len(results))
+                metrics_snapshot = self.metrics.get_snapshot()
+                new_concurrency = self.controller.update(metrics_snapshot)
+                if new_concurrency != concurrency:
+                    print(f"  [Concurrency adjusted: {concurrency} -> {new_concurrency}]")
+                    concurrency = new_concurrency
 
             # Stats
             elapsed = time.perf_counter() - self.start_time
@@ -167,14 +240,23 @@ class DomainChecker:
             available = sum(1 for r in results if r.status == "available")
             errors = sum(1 for r in results if r.status == "error")
 
-            print(
-                f"Batch: {len(results):,} domains | "
-                f"T:{taken} A:{available} E:{errors} | "
-                f"{batch_throughput:.0f}/sec | "
-                f"Total: {self.domains_checked:,}/{total_domains:,} "
-                f"({self.domains_checked/total_domains*100:.1f}%) | "
+            # Build status line
+            status_parts = [
+                f"Batch: {len(results):,} | ",
+                f"T:{taken} A:{available} E:{errors} | ",
+                f"{batch_throughput:.0f}/sec | ",
+                f"Total: {self.domains_checked:,}/{total_domains:,} ",
+                f"({self.domains_checked/total_domains*100:.1f}%) | ",
                 f"Overall: {throughput:.0f}/sec"
-            )
+            ]
+
+            # Add adaptive metrics
+            if self.adaptive:
+                status_parts.append(f" | C:{concurrency}")
+                if metrics_snapshot.timeout_rate > 0.001:
+                    status_parts.append(f" TO:{metrics_snapshot.timeout_rate*100:.1f}%")
+
+            print("".join(status_parts))
 
             # Checkpoint
             if self.domains_checked - self.last_checkpoint >= checkpoint_interval:
@@ -222,17 +304,18 @@ async def run_iteration4_test():
 
     # Create test database
     test_variations = create_test_database(1000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_domain_checks.duckdb")
+    test_checks = Path(__file__).parent.parent / "test_domain_checks.duckdb"
 
     # Remove old checks
     if test_checks.exists():
         test_checks.unlink()
 
-    # Create checker
+    # Create checker (uses PROXY_FILE from whois_checker which respects env vars)
+    from whois_checker import PROXY_FILE
     checker = DomainChecker(
         variations_db=test_variations,
         checks_db=test_checks,
-        proxy_file=Path("/Users/collinsoik/Desktop/Code_Space/Proxy Status Checker/proxies.txt"),
+        proxy_file=PROXY_FILE,
         max_proxies=50
     )
 
@@ -254,13 +337,14 @@ async def run_iteration5_test():
 
     # Create test database with 2000 domains
     test_variations = create_test_database(2000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_resume_checks.duckdb")
+    test_checks = Path(__file__).parent.parent / "test_resume_checks.duckdb"
 
     # Remove old checks
     if test_checks.exists():
         test_checks.unlink()
 
-    proxy_file = Path("/Users/collinsoik/Desktop/Code_Space/Proxy Status Checker/proxies.txt")
+    from whois_checker import PROXY_FILE
+    proxy_file = PROXY_FILE
 
     print("\n--- PHASE 1: Check first 1000 domains ---")
 
@@ -330,13 +414,14 @@ async def run_iteration6_test():
 
     # Create test database with 100K domains
     test_variations = create_test_database(100000)
-    test_checks = Path("/Users/collinsoik/Desktop/Code_Space/rdap_test/test_100k_checks.duckdb")
+    test_checks = Path(__file__).parent.parent / "test_100k_checks.duckdb"
 
     # Remove old checks
     if test_checks.exists():
         test_checks.unlink()
 
-    proxy_file = Path("/Users/collinsoik/Desktop/Code_Space/Proxy Status Checker/proxies.txt")
+    from whois_checker import PROXY_FILE
+    proxy_file = PROXY_FILE
 
     # Create checker with all proxies
     checker = DomainChecker(

@@ -1,30 +1,42 @@
 # High-Performance Domain Availability Checker
 
-A massively scalable domain availability checker using the WHOIS protocol with proxy rotation. Designed to check **700M+ domains** efficiently.
+A massively scalable domain availability checker using the WHOIS protocol with proxy rotation and **adaptive rate control**. Designed to check **704M+ .com domains** efficiently while respecting Verisign rate limits.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 3,700 domains/sec |
-| **Success Rate** | 100% |
-| **704M domains** | ~53 hours (~2.2 days) |
+| **Sustained Throughput** | 550-650 domains/sec |
+| **Success Rate** | 99.9% |
+| **704M domains** | ~12-14 days |
 | **Bandwidth** | ~157 GB total |
+
+### Why Not Faster?
+
+Verisign (the .com WHOIS authority) enforces rate limiting:
+- **Single IP**: Throttled to ~50/sec with 13% timeouts
+- **1000 Proxies**: Sustained ~650/sec (each IP gets its own rate limit bucket)
+- **Burst vs Sustained**: Initial burst can hit 4,000/sec but drops to 600-700/sec
+
+The adaptive rate controller automatically detects and responds to rate limiting.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                   DOMAIN VARIATIONS DB                       │
-│                (DuckDB - 704M+ domains)                      │
+│             (domain_variations.duckdb - 704M+)               │
 └───────────────────────────┬─────────────────────────────────┘
                             │
                      ┌──────▼──────┐
                      │   DOMAIN    │
                      │   CHECKER   │
                      │             │
-                     │ Batch: 10K  │
-                     │ Checkpoint  │
+                     │ ┌─────────┐ │
+                     │ │ADAPTIVE │ │
+                     │ │  RATE   │ │
+                     │ │CONTROL  │ │
+                     │ └─────────┘ │
                      └──────┬──────┘
                             │
               ┌─────────────┼─────────────┐
@@ -45,14 +57,63 @@ A massively scalable domain availability checker using the WHOIS protocol with p
                      ┌──────▼──────┐
                      │   RESULTS   │
                      │  (DuckDB)   │
+                     │ domain_checks.duckdb │
                      └─────────────┘
 ```
+
+## Adaptive Rate Control System
+
+The checker includes an intelligent rate controller that maximizes throughput while avoiding rate limit penalties.
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    METRICS TRACKER                           │
+│  - Rolling latency window (last 100 queries)                │
+│  - Timeout rate (last 1000 queries)                         │
+│  - Real-time throughput calculation                         │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                     ┌──────▼──────┐
+                     │  ADAPTIVE   │
+                     │ CONTROLLER  │
+                     │             │
+                     │ Evaluates:  │
+                     │ - Latency   │
+                     │ - Timeouts  │
+                     │ - Throughput│
+                     └──────┬──────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+         INCREASE      DECREASE       PAUSE
+         (+10%)        (-20%)      (30s reset)
+```
+
+### Rate Control Thresholds
+
+| Signal | Threshold | Action |
+|--------|-----------|--------|
+| Low latency | Avg < 120ms | Increase concurrency 10% |
+| High latency | Avg > 200ms | Decrease concurrency 20% |
+| Critical latency | P95 > 500ms | Severe decrease 50% |
+| Warning timeout | > 1% | Decrease concurrency 20% |
+| High timeout | > 2% | Severe decrease 50% |
+| Critical timeout | > 5% | Pause 30s, reset to 50% |
+
+### Controller States
+
+- **RAMPING_UP**: Increasing concurrency (good conditions)
+- **STABLE**: Maintaining current rate
+- **BACKING_OFF**: Decreasing concurrency (rate limiting detected)
+- **PAUSED**: Temporarily stopped due to severe throttling
 
 ## Key Optimizations
 
 ### 1. WHOIS over RDAP
-- **1.7x faster** than RDAP (~130ms vs ~200ms latency)
-- **5x less bandwidth** (64 bytes vs 400+ bytes per query)
+- **5x faster** than RDAP (~100ms vs ~500ms latency)
+- Tested both protocols - WHOIS clearly superior for bulk checking
 
 ### 2. Minimal Response Reading
 - Only reads first **64 bytes** of WHOIS response
@@ -61,78 +122,56 @@ A massively scalable domain availability checker using the WHOIS protocol with p
   - `"Domain Name"` → Taken
 
 ### 3. Optimal Concurrency
-- **1 connection per proxy** (bottleneck analysis confirmed this is optimal)
-- 1000 proxies = 1000 concurrent connections
-- Higher per-proxy concurrency causes failures
+- **1 connection per proxy** (bottleneck analysis confirmed)
+- Adaptive controller adjusts between 50-800 concurrent connections
+- Default: 500 initial, scales based on conditions
 
-### 4. Checkpoint/Resume System
-- Saves progress every 100K domains (~27 seconds)
+### 4. Optimized Database Writes
+- **Bulk insert with temp table + upsert** (2.6x faster than row-by-row)
+- Transactional writes for data integrity
+- DuckDB for high-performance columnar storage
+
+### 5. Checkpoint/Resume System
+- Saves progress every 100K domains
 - Automatic resume on restart
 - No duplicate checks
 
-## Data Usage
+## Data Files
 
-| Component | Bytes/Query |
-|-----------|-------------|
-| CONNECT request (sent) | ~107 |
-| WHOIS query (sent) | ~21 |
-| CONNECT response (recv) | ~39 |
-| WHOIS response (recv) | 64 |
-| **Total** | **~239** |
+| File | Description | Size |
+|------|-------------|------|
+| `domain_variations.duckdb` | Source database with 704M+ domains | ~15 GB |
+| `domain_checks.duckdb` | Results database (created on run) | ~20 GB (estimated final) |
+| `proxies.txt` | Proxy list file | ~50 KB |
 
-**704M domains = ~157 GB total bandwidth**
+**Note**: Database files are not included in the repository due to size. The results database is created automatically on first run.
 
 ## Installation
 
-### Local Development (Linux/macOS)
+### Docker (Recommended)
 
 ```bash
 # Clone the repo
 git clone <repo-url>
-cd rdap_test
+cd domain-checker
 
+# Build and run
+docker compose up -d
+
+# Monitor progress
+./monitor.sh 15
+```
+
+### Local Development
+
+```bash
 # Create virtual environment
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Linux/macOS
+# or: .\venv\Scripts\Activate.ps1  # Windows
 
 # Install dependencies
 pip install -r requirements.txt
-```
-
-### Local Development (Windows)
-
-```powershell
-# Clone the repo
-git clone <repo-url>
-cd rdap_test
-
-# Create virtual environment
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### Docker - Linux (Recommended for Production)
-
-```bash
-# Build the Linux image
-docker build -f Dockerfile.linux -t domain-checker .
-
-# Or use docker-compose
-docker-compose up -d
-```
-
-### Docker - Windows
-
-```powershell
-# Build the Windows image (requires Windows containers mode)
-docker build -f Dockerfile.windows -t domain-checker .
-
-# Or use docker-compose
-$env:DOCKERFILE="Dockerfile.windows"
-docker-compose up -d
 ```
 
 ## Configuration
@@ -150,6 +189,17 @@ docker-compose up -d
 | `LIMIT` | Max domains to check | All |
 | `RESUME` | Resume from checkpoint | true |
 
+### Adaptive Rate Control Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RATE_INITIAL_CONCURRENCY` | Starting concurrency | 500 |
+| `RATE_MAX_CONCURRENCY` | Maximum allowed concurrency | 800 |
+| `RATE_MIN_CONCURRENCY` | Minimum allowed concurrency | 50 |
+| `RATE_LATENCY_LOW_MS` | Latency below which to increase | 120 |
+| `RATE_LATENCY_HIGH_MS` | Latency above which to decrease | 200 |
+| `RATE_TIMEOUT_HIGH` | Timeout rate triggering decrease | 0.02 (2%) |
+
 ### Proxy File Format
 
 ```
@@ -162,37 +212,26 @@ user2:pass2@ip2:port2
 
 ### Production Run (Docker)
 
-1. Create a `data/` directory with:
-   - `domain_variations.duckdb` - Your domain source database
-   - `proxies.txt` - Your proxy list
-
-2. Run with docker-compose:
 ```bash
-docker-compose up -d
+# Start the checker
+docker compose up -d
+
+# Monitor progress
+./monitor.sh 15
+
+# View logs
+docker logs -f domain-checker
+
+# Stop gracefully
+docker compose down
 ```
 
-3. Monitor logs:
-```bash
-docker-compose logs -f
-```
-
-### Production Run (Local - Linux/macOS)
+### Production Run (Local)
 
 ```bash
 export VARIATIONS_DB=/path/to/domain_variations.duckdb
 export CHECKS_DB=/path/to/domain_checks.duckdb
 export PROXY_FILE=/path/to/proxies.txt
-
-cd src
-python domain_checker.py --run
-```
-
-### Production Run (Local - Windows)
-
-```powershell
-$env:VARIATIONS_DB="C:\data\domain_variations.duckdb"
-$env:CHECKS_DB="C:\data\domain_checks.duckdb"
-$env:PROXY_FILE="C:\data\proxies.txt"
 
 cd src
 python domain_checker.py --run
@@ -213,25 +252,38 @@ python domain_checker.py --test-resume
 python domain_checker.py --test-100k
 ```
 
+### Benchmarking
+
+```bash
+cd src
+
+# Benchmark with timing breakdown
+python benchmark_timing.py --domains 1000 --proxies 100 --concurrency 100
+
+# Single proxy baseline test
+python benchmark_timing.py --single
+```
+
 ## Project Structure
 
 ```
-rdap_test/
+domain-checker/
 ├── src/
+│   ├── domain_checker.py   # Main orchestrator with adaptive control
 │   ├── whois_checker.py    # Core WHOIS checker (64-byte optimization)
 │   ├── proxy_pool.py       # Proxy management with health tracking
-│   ├── database.py         # DuckDB integration for results
-│   └── domain_checker.py   # Main orchestrator with checkpointing
-├── data/                   # Data directory (mount point for Docker)
-│   ├── domain_variations.duckdb  # Source database (704M domains)
+│   ├── database.py         # DuckDB integration (optimized bulk writes)
+│   ├── metrics.py          # Rolling metrics tracker for rate control
+│   ├── rate_controller.py  # Adaptive concurrency controller
+│   └── benchmark_timing.py # Performance benchmarking tool
+├── data/
+│   ├── domain_variations.duckdb  # Source database (not in repo)
 │   ├── domain_checks.duckdb      # Results database (created on run)
-│   └── proxies.txt               # Proxy list file
-├── tests/                  # Protocol and integration tests
-├── benchmarks/             # Performance analysis scripts
+│   └── proxies.txt               # Proxy list (not in repo)
+├── monitor.sh              # Progress monitoring script
 ├── Dockerfile.linux        # Linux container configuration
 ├── Dockerfile.windows      # Windows container configuration
-├── docker-compose.yml      # Easy deployment (auto-selects platform)
-├── .env.example            # Environment variable template
+├── docker-compose.yml      # Docker deployment configuration
 ├── requirements.txt        # Python dependencies
 └── README.md
 ```
@@ -242,7 +294,9 @@ rdap_test/
 
 Expected table: `domain_variations`
 ```sql
-domain VARCHAR  -- The domain to check (e.g., 'example.com')
+CREATE TABLE domain_variations (
+    domain VARCHAR PRIMARY KEY  -- e.g., 'example.com'
+);
 ```
 
 ### Results Database (domain_checks.duckdb)
@@ -253,67 +307,122 @@ CREATE TABLE domain_checks (
     domain VARCHAR PRIMARY KEY,
     status VARCHAR NOT NULL,  -- 'taken', 'available', 'error', 'unknown'
     error VARCHAR,
-    checked_at TIMESTAMP
+    checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE checkpoints (
     id INTEGER PRIMARY KEY,
     last_offset BIGINT,
     total_checked BIGINT,
-    updated_at TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX idx_status ON domain_checks(status);
 ```
 
-## Scaling Estimates
+## Performance Tuning
 
-| Proxies | Throughput | 704M Runtime |
-|---------|------------|--------------|
-| 100 | 370/sec | 22 days |
-| 250 | 925/sec | 8.8 days |
-| 500 | 1,850/sec | 4.4 days |
-| 750 | 2,775/sec | 2.9 days |
-| **1000** | **3,700/sec** | **2.2 days** |
-| 1500+ | 5,000/sec* | 1.6 days |
+### Tested Configurations
 
-*Capped by Verisign rate limits
+| Concurrency | Throughput | Notes |
+|-------------|------------|-------|
+| 300 | 586/sec | Conservative, very stable |
+| 500 | 651/sec | **Recommended** - best balance |
+| 800 | 668/sec | Marginal gain, more resource usage |
 
-## Bottleneck Analysis
+### Direct vs Proxy Performance
 
-The system was optimized through iterative testing:
+| Setup | Burst | Sustained | Timeouts |
+|-------|-------|-----------|----------|
+| Direct (no proxy) | 2,677/sec | 54/sec | 13% |
+| 1000 Proxies | 800/sec | 650/sec | 0% |
 
-1. **Per-proxy concurrency**: Testing showed 1 connection per proxy is optimal. Higher concurrency per proxy causes connection failures.
+Proxies provide **12x better sustained throughput** by distributing queries across multiple IP addresses.
 
-2. **Protocol choice**: WHOIS chosen over RDAP for 1.7x speed improvement and 5x bandwidth reduction.
+## Monitoring
 
-3. **Response reading**: Only 64 bytes needed to determine availability status.
+### Progress Monitor Script
 
-4. **Server limits**: Verisign caps total throughput at ~5,000/sec regardless of proxy count.
+```bash
+# Sample for 15 seconds and show stats
+./monitor.sh 15
 
-## Deployment Checklist
+# Output:
+# ============================================
+#   DOMAIN CHECKER PROGRESS
+# ============================================
+#   Checked:    294,180 / 704,023,090 (.0417%)
+#   Available:  280,619
+#   Taken:      13,560
+# --------------------------------------------
+#   Rate:       610.0 domains/sec
+#   ETA:        320.4 hours (13.35 days)
+# ============================================
+```
 
-- [ ] Copy `domain_variations.duckdb` to target machine
-- [ ] Create proxy list file with valid proxies
-- [ ] Set environment variables or create `.env` file
-- [ ] Build Docker image or install Python dependencies
-- [ ] Run initial test with `--test` flag
-- [ ] Start production run with `--run` flag
-- [ ] Monitor logs for errors
+### Docker Commands
+
+```bash
+# Check container status
+docker ps
+
+# View real-time logs
+docker logs -f domain-checker
+
+# Resource usage
+docker stats domain-checker
+
+# Restart after config change
+docker compose down && docker compose up -d
+```
 
 ## Troubleshooting
 
-### High Error Rate
-- Check proxy health (proxies may be rate-limited or banned)
-- Reduce `MAX_PROXIES` to use fewer, healthier proxies
-- Check network connectivity
+### Rate Limiting Detected
+
+If you see `[Concurrency adjusted: X -> Y]` messages:
+- The adaptive controller is working correctly
+- Concurrency will recover when conditions improve
+- If stuck at minimum, check proxy health
+
+### High Timeout Rate
+
+- Check proxy connectivity
+- Reduce `RATE_INITIAL_CONCURRENCY`
+- Verify proxies aren't IP-banned
 
 ### Slow Throughput
-- Increase proxy count
-- Verify proxies are geographically distributed
-- Check for network bottlenecks
+
+- Increase proxy count (more IPs = more rate limit budget)
+- Check network latency to proxies
+- Ensure proxies are geographically distributed
 
 ### Resume Not Working
+
 - Ensure `CHECKS_DB` path is consistent between runs
-- Check that checkpoint table exists in results database
+- Check that checkpoint table exists
+- Verify database isn't corrupted
+
+### Database Locked Error
+
+- Only one process can write to DuckDB at a time
+- Stop any other checkers before starting
+- The monitor script copies the DB to avoid locks
+
+## Runtime Projections
+
+| Throughput | 704M Runtime | Use Case |
+|------------|--------------|----------|
+| 400/sec | 20.4 days | Conservative/unstable proxies |
+| 550/sec | 14.8 days | Typical sustained |
+| 650/sec | 12.5 days | Optimal conditions |
+| 1000/sec | 8.1 days | Multi-pool setup (future) |
+
+## Future Improvements
+
+- **Multi-pool support**: Run multiple independent proxy pools for higher aggregate throughput
+- **Distributed checking**: Spread across multiple machines
+- **Result streaming**: Export available domains in real-time
 
 ## License
 
